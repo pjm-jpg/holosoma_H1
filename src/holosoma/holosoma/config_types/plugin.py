@@ -113,3 +113,52 @@ class GantryControlPluginConfig(PluginConfig):
         from holosoma.simulator.shared.ros2_plugins import GantryControlPlugin
 
         return GantryControlPlugin
+
+
+@dataclass(frozen=True)
+class ROS2OdometryPluginConfig(PluginConfig):
+    """Publish the robot base pose/velocity as ``nav_msgs/Odometry`` over ROS2.
+
+    A self-sourced (non-camera) egress plugin: it reads base pose/velocity straight off
+    ``simulator.robot_root_states`` each control step (the sim analog of the robot's onboard
+    sport/odom estimate) — so it uses no camera base class, just registers a ``FRAME_END`` publish
+    like :class:`ClockPublishPluginConfig`. rclpy is optional (``holosoma[ros2]``), imported lazily
+    via :meth:`get_cls`.
+    """
+
+    node_name: str = "sim_odometry"
+    """ROS2 node name created for this sink."""
+
+    topic: str = "/odom"
+    """Topic to publish the ``nav_msgs/Odometry`` on."""
+
+    frame_id: str = "odom"
+    """``header.frame_id``: the fixed frame the pose is expressed in (odometry origin)."""
+
+    child_frame_id: str = "base_link"
+    """``child_frame_id``: the moving body frame the twist is expressed in."""
+
+    qos: str = "best_effort"
+    """QoS profile: ``best_effort`` (default) or ``reliable``."""
+
+    env_id: int = 0
+    """Which environment's base state to publish. Default 0 (the single real-time robot)."""
+
+    publish_every: DecimationLike = 1
+    """How often to publish, on the CONTROL rate (base state is fresh after each frame's tensor
+    refresh). Either a decimation int (publish every Nth control step) or a frequency string
+    (``"50Hz"``, ``">50Hz"``, ``"<50Hz"``) resolved at install time against the control rate."""
+
+    def __post_init__(self) -> None:
+        validate_decimation_like(self.publish_every, field="publish_every")
+        if self.qos not in ("best_effort", "reliable"):
+            raise ValueError(f"ROS2OdometryPluginConfig.qos must be 'best_effort' or 'reliable', got '{self.qos}'.")
+        if not self.topic:
+            raise ValueError("ROS2OdometryPluginConfig.topic must be a non-empty topic.")
+        if self.env_id < 0:
+            raise ValueError(f"ROS2OdometryPluginConfig.env_id must be >= 0, got {self.env_id}.")
+
+    def get_cls(self) -> Callable[..., Any]:
+        from holosoma.simulator.shared.ros2_plugins import ROS2OdometryPlugin
+
+        return ROS2OdometryPlugin

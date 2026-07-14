@@ -5,6 +5,7 @@ from holosoma.config_types.plugin import (
     GantryControlPluginConfig,
     NoOpPluginConfig,
     PluginConfig,
+    ROS2OdometryPluginConfig,
 )
 from holosoma.utils.config_registry import ConfigRegistry, deprecated_defaults_alias
 
@@ -20,5 +21,10 @@ none = PLUGIN_REGISTRY.add("none", NoOpPluginConfig())
 # configs stay rclpy-free, so registering them here does not require ROS.
 clock_publish = PLUGIN_REGISTRY.add("clock_publish", ClockPublishPluginConfig())
 gantry_control = PLUGIN_REGISTRY.add("gantry_control", GantryControlPluginConfig())
+
+# Robot base pose/velocity as nav_msgs/Odometry — a self-sourced (non-camera) egress plugin that
+# reads robot_root_states each control step. Rides the same in-process rclpy transport as the image
+# egress (no CycloneDDS entanglement with the Unitree SDK bridge).
+odometry = PLUGIN_REGISTRY.add("odometry", ROS2OdometryPluginConfig())
 
 __getattr__ = deprecated_defaults_alias(__name__, PLUGIN_REGISTRY)

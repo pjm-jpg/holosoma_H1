@@ -1,10 +1,12 @@
 """ROS2 example plugins.
 
-Two reference plugin implementations that talk ROS2 (each constructed as
+Reference plugin implementations that talk ROS2 (each constructed as
 ``cls(cfg, simulator)`` and registering hooks on ``simulator.hooks`` — no base class):
 
 - :class:`ClockPublishPlugin` publishes sim time as ``rosgraph_msgs/msg/Clock``.
 - :class:`GantryControlPlugin` drives the virtual gantry from three independent topics.
+- :class:`ROS2OdometryPlugin` publishes the robot base pose/velocity as ``nav_msgs/Odometry`` — a
+  self-sourced egress that reads ``robot_root_states`` each control step (no camera frames).
 
 rclpy and the ROS message packages are an **optional** dependency (``holosoma[ros2]``).
 They are imported lazily inside methods (never at module top), mirroring
@@ -26,7 +28,11 @@ from loguru import logger
 from holosoma.simulator.base_simulator.hooks import Phase
 
 if TYPE_CHECKING:
-    from holosoma.config_types.plugin import ClockPublishPluginConfig, GantryControlPluginConfig
+    from holosoma.config_types.plugin import (
+        ClockPublishPluginConfig,
+        GantryControlPluginConfig,
+        ROS2OdometryPluginConfig,
+    )
     from holosoma.simulator.base_simulator.base_simulator import BaseSimulator
 
 
@@ -191,6 +197,131 @@ class GantryControlPlugin:
 
     def close(self) -> None:
         """Stop the spin thread and tear down the ROS2 node (idempotent)."""
+        stop = getattr(self, "_spin_stop", None)
+        if stop is not None:
+            stop.set()
+        thread = getattr(self, "_spin_thread", None)
+        if thread is not None:
+            thread.join(timeout=1.0)
+            self._spin_thread = None
+        node = getattr(self, "_node", None)
+        if node is not None:
+            node.destroy_node()
+            self._node = None
+
+
+def _sim_time_to_stamp(sim_time: float):
+    """Build a builtin_interfaces/Time from sim seconds (deferred import; only after start())."""
+    from builtin_interfaces.msg import Time
+
+    sec = int(sim_time)
+    nanosec = round((sim_time - sec) * 1e9)
+    if nanosec >= 1_000_000_000:  # rounding carry
+        sec += 1
+        nanosec -= 1_000_000_000
+    return Time(sec=sec, nanosec=nanosec)
+
+
+class ROS2OdometryPlugin:
+    """Publish the robot base pose/velocity as ``nav_msgs/Odometry`` on a ROS2 topic.
+
+    A self-sourced (non-camera) egress plugin: each control step it reads the base state off
+    ``simulator.robot_root_states`` — the sim analog of the robot's onboard sport/odom estimate — and
+    publishes one ``nav_msgs/Odometry``. Fires on ``FRAME_END`` (base tensors fresh after the frame's
+    refresh), so ``publish_every`` resolves against the control rate. Rides the same in-process rclpy
+    transport the image egress uses (no CycloneDDS entanglement with the Unitree SDK bridge).
+
+    Base velocities in ``robot_root_states`` are WORLD-frame on every backend (the unified contract);
+    ``nav_msgs/Odometry`` expresses its twist in the ``child_frame_id`` (body) frame, so they are
+    rotated world->body via :func:`quat_rotate_inverse`. Timestamps come from sim_time, not wall-clock.
+    """
+
+    cfg: ROS2OdometryPluginConfig
+
+    def __init__(self, cfg: ROS2OdometryPluginConfig, simulator: BaseSimulator) -> None:
+        self.cfg = cfg
+        self.simulator = simulator
+        import rclpy
+        from nav_msgs.msg import Odometry
+        from rclpy.qos import HistoryPolicy, QoSProfile, ReliabilityPolicy
+
+        self._Odometry = Odometry
+
+        _ensure_ros2_init()
+        self._node = rclpy.create_node(cfg.node_name)
+        reliability = ReliabilityPolicy.RELIABLE if cfg.qos == "reliable" else ReliabilityPolicy.BEST_EFFORT
+        qos = QoSProfile(reliability=reliability, history=HistoryPolicy.KEEP_LAST, depth=1)
+        self._pub = self._node.create_publisher(Odometry, cfg.topic, qos)
+
+        # A daemon spin thread so QoS handshakes progress without a sim-side spin (publish-only node).
+        self._spin_stop = threading.Event()
+        self._spin_thread: threading.Thread | None = threading.Thread(
+            target=self._spin, name=f"odometry_spin:{cfg.node_name}", daemon=True
+        )
+        self._spin_thread.start()
+
+        logger.info(f"ROS2OdometryPlugin publishing base odometry on '{cfg.topic}' (node '{cfg.node_name}')")
+
+        # `every` accepts an int decimation or a frequency string ("50Hz"); the registry decimates natively.
+        self.simulator.hooks.add(Phase.FRAME_END, self.publish, name="odometry.publish", every=cfg.publish_every)
+        self.simulator.hooks.add(Phase.CLOSE, self.close, name="odometry.close")
+
+    def _spin(self) -> None:
+        import rclpy
+
+        while not self._spin_stop.is_set():
+            rclpy.spin_once(self._node, timeout_sec=0.1)
+
+    def publish(self) -> None:
+        pos, quat_xyzw, lin_vel_body, ang_vel_body, sim_time = self._read_base_state()
+        msg = self._Odometry()
+        msg.header.stamp = _sim_time_to_stamp(sim_time)
+        msg.header.frame_id = self.cfg.frame_id
+        msg.child_frame_id = self.cfg.child_frame_id
+
+        msg.pose.pose.position.x = pos[0]
+        msg.pose.pose.position.y = pos[1]
+        msg.pose.pose.position.z = pos[2]
+        # robot_root_states quaternion is xyzw; ROS geometry_msgs/Quaternion is also xyzw — direct copy.
+        msg.pose.pose.orientation.x = quat_xyzw[0]
+        msg.pose.pose.orientation.y = quat_xyzw[1]
+        msg.pose.pose.orientation.z = quat_xyzw[2]
+        msg.pose.pose.orientation.w = quat_xyzw[3]
+
+        msg.twist.twist.linear.x = lin_vel_body[0]
+        msg.twist.twist.linear.y = lin_vel_body[1]
+        msg.twist.twist.linear.z = lin_vel_body[2]
+        msg.twist.twist.angular.x = ang_vel_body[0]
+        msg.twist.twist.angular.y = ang_vel_body[1]
+        msg.twist.twist.angular.z = ang_vel_body[2]
+
+        self._pub.publish(msg)
+
+    def _read_base_state(self) -> tuple[list[float], list[float], list[float], list[float], float]:
+        """Read env ``cfg.env_id`` base state off the sim as plain floats.
+
+        Returns ``(position, quat_xyzw, lin_vel_body, ang_vel_body, sim_time)``. The unified
+        ``robot_root_states`` 13-vector is ``[pos(3), quat_xyzw(4), lin_vel_world(3), ang_vel_world(3)]``;
+        the world-frame velocities are rotated into the base (body) frame for the Odometry twist.
+        """
+        from holosoma.utils.rotations import quat_rotate_inverse
+
+        env = self.cfg.env_id
+        root = self.simulator.robot_root_states[env]  # [13]
+        quat_xyzw = root[3:7]  # xyzw
+        lin_vel_world = root[7:10].unsqueeze(0)
+        ang_vel_world = root[10:13].unsqueeze(0)
+        lin_vel_body = quat_rotate_inverse(quat_xyzw.unsqueeze(0), lin_vel_world, w_last=True).squeeze(0)
+        ang_vel_body = quat_rotate_inverse(quat_xyzw.unsqueeze(0), ang_vel_world, w_last=True).squeeze(0)
+
+        pos = root[0:3].detach().cpu().tolist()
+        quat = quat_xyzw.detach().cpu().tolist()
+        lin = lin_vel_body.detach().cpu().tolist()
+        ang = ang_vel_body.detach().cpu().tolist()
+        return pos, quat, lin, ang, self.simulator.time()
+
+    def close(self) -> None:
+        """Stop the spin thread and tear down the ROS2 node (idempotent; safe from Phase.CLOSE)."""
         stop = getattr(self, "_spin_stop", None)
         if stop is not None:
             stop.set()
